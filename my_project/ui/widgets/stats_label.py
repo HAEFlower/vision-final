@@ -12,18 +12,18 @@ class StatsLabel(QLabel):
 
     def build_initial_text(self):
         stats_html = (
-            "<p style='font-size:18pt; font-weight:bold; margin:0;'>Total: 0</p>"
+            "<p style='font-size:30pt; font-weight:bold; margin:0 0 20px;'>Total: 0</p>"
         )
         for cls in range(self.num_classes):
             stats_html += (
-                f"<p style='font-size:14pt; margin:0;'>Class {cls}: 0 (0.0%)</p>"
+                f"<p style='font-size:24pt; margin:0 0 15px;'>Class {cls}: 0 (0.0%)</p>"
             )
         return stats_html
 
     def update_text(self, total_count, class_counts):
-        stats_html = f"<p style='font-size:18pt; font-weight:bold; margin:0;'>Total: {total_count}</p>"
+        stats_html = f"<p style='font-size:30pt; font-weight:bold; margin:0 0 20px;'>Total: {total_count}</p>"
         for cls in range(self.num_classes):
             count = class_counts.get(cls, 0)
             percent = (count / total_count * 100) if total_count > 0 else 0.0
-            stats_html += f"<p style='font-size:14pt; margin:0;'>Class {cls}: {count} ({percent:.1f}%)</p>"
+            stats_html += f"<p style='font-size:24pt; margin:0 0 15px;'>Class {cls}: {count} ({percent:.1f}%)</p>"
         self.setText(stats_html)

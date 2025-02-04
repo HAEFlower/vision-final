@@ -7,5 +7,5 @@ class TimeLabel(QLabel):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.setFont(QFont("Arial", 10))
-        self.setFixedHeight(20)
+        self.setFont(QFont("Arial", 24))
+        self.setFixedHeight(30)
