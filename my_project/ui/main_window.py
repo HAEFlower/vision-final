@@ -1,7 +1,6 @@
 import sys
 import cv2
-import os
-import torch
+import numpy as np
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QApplication
 from PyQt5.QtCore import QTimer, QDateTime
 from PyQt5.QtGui import QImage, QPixmap
@@ -12,6 +11,7 @@ from ui.widgets.stats_label import StatsLabel
 from ui.widgets.recent_images_widget import RecentImagesWidget
 from ui.widgets.roi_label import ROILabel  # ROI를 그릴 수 있는 QLabel subclass
 from model.yolo_model import load_model, run_inference
+from utils.sort import Sort
 
 # 사전 로드된 YOLO 모델
 yolo_model = load_model()
@@ -25,6 +25,8 @@ class MainWindow(QWidget):
         # ROI 영역 내에 객체가 차지해야 하는 최소 비율 (0.6 = 60%)
         self.roi_threshold = 0.6
 
+        self.tracker = Sort()
+        self.track_flags = {}
         self.initialize_window()
         self.setup_ui_components()
         self.initialize_variables()
@@ -125,14 +127,12 @@ class MainWindow(QWidget):
         if not ret:
             return
 
-        # 좌우 미러링 (사용자에게 친숙한 화면 제공)
+        # 좌우 미러링 및 640x360 리사이즈
         frame = cv2.flip(frame, 1)
-
-        # 전체 프레임을 640x360으로 리사이즈
         display_frame = cv2.resize(frame, (640, 360))
         disp_h, disp_w, _ = display_frame.shape
 
-        # ROI 영역 (ROILabel에서 지정된 영역; display_frame 크기에 맞춤)
+        # ROI 영역 (ROILabel에서 지정; display_frame 좌표 기준)
         roi = self.roi_label.roi_rect
         if roi is not None:
             roi_x1 = max(0, roi.x())
@@ -140,18 +140,17 @@ class MainWindow(QWidget):
             roi_x2 = min(disp_w, roi.x() + roi.width())
             roi_y2 = min(disp_h, roi.y() + roi.height())
 
-        # 전체 화면(display_frame)에 대해 inference 실행
+        # YOLO inference (전체 화면 기준)
         try:
             results = run_inference(yolo_model, display_frame)
         except Exception as e:
             print("YOLO detection error:", e)
             results = None
 
+        # valid_det_info: [x1, y1, x2, y2, conf, class_id] for detections passing ROI threshold
+        valid_det_info = []
         annotated_frame = display_frame.copy()
-        valid_detection = False
-
         if results is not None and results[0].boxes is not None:
-            # 결과에서 박스, 신뢰도, 클래스 아이디를 numpy 배열로 변환
             try:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
                 confs = results[0].boxes.conf.cpu().numpy()
@@ -161,7 +160,6 @@ class MainWindow(QWidget):
                 confs = results[0].boxes.conf.numpy()
                 cls_ids = results[0].boxes.cls.numpy()
 
-            # 각 검출 박스에 대해 ROI와의 겹침(Overlap) 비율 계산 및 표시
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = box
                 detection_area = max(1, (x2 - x1) * (y2 - y1))
@@ -176,81 +174,94 @@ class MainWindow(QWidget):
                     ratio = intersection_area / detection_area
                 else:
                     ratio = 1.0
-
-                # roi_threshold (예: 0.6) 이상인 경우에만 valid로 판단
+                # 기준 비율 통과라면 유효 검출
                 if ratio >= self.roi_threshold:
-                    valid_detection = True
-
-                    # 박스 그리기 (색: 초록, 두께: 2)
+                    valid_det_info.append([x1, y1, x2, y2, confs[i], int(cls_ids[i])])
+                    # (옵션) 원본에 파란색 박스 그리기
                     cv2.rectangle(
                         annotated_frame,
                         (int(x1), int(y1)),
                         (int(x2), int(y2)),
-                        (0, 255, 0),
-                        2,
+                        (255, 0, 0),
+                        1,
                     )
 
-                    # 클래스 이름 및 신뢰도 표시를 위한 폰트 설정
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 0.5
-                    thickness = 1
+        # SORT tracker 업데이트 — tracker.update()는 [x1,y1,x2,y2,conf] 형식만 필요
+        if len(valid_det_info) > 0:
+            dets = np.array(valid_det_info)[:, :5]  # shape (N, 5)
+            tracked_objects = self.tracker.update(dets)
+        else:
+            tracked_objects = np.empty((0, 5))
 
-                    # 클래스 이름 (왼쪽 상단)
-                    class_id = int(cls_ids[i])
-                    conf = confs[i]
-                    if hasattr(yolo_model.model, "names"):
-                        class_name = yolo_model.model.names.get(class_id, "Unknown")
-                    else:
-                        class_name = str(class_id)
-                    (text_w, text_h), baseline = cv2.getTextSize(
-                        class_name, font, font_scale, thickness
-                    )
-                    # 배경 사각형 (클래스 이름 표시 영역)
-                    cv2.rectangle(
-                        annotated_frame,
-                        (int(x1), int(y1) - text_h - baseline),
-                        (int(x1) + text_w, int(y1)),
-                        (0, 255, 0),
-                        -1,
-                    )
-                    cv2.putText(
-                        annotated_frame,
-                        class_name,
-                        (int(x1), int(y1) - baseline),
-                        font,
-                        font_scale,
-                        (0, 0, 0),
-                        thickness,
-                        cv2.LINE_AA,
-                    )
+        valid_detection = False
+        current_track_ids = set()
 
-                    # 신뢰도 (오른쪽 상단)
-                    conf_str = f"{conf:.2f}"
-                    (conf_w, conf_h), conf_baseline = cv2.getTextSize(
-                        conf_str, font, font_scale, thickness
-                    )
-                    cv2.rectangle(
-                        annotated_frame,
-                        (int(x2) - conf_w, int(y1) - conf_h - conf_baseline),
-                        (int(x2), int(y1)),
-                        (0, 255, 0),
-                        -1,
-                    )
-                    cv2.putText(
-                        annotated_frame,
-                        conf_str,
-                        (int(x2) - conf_w, int(y1) - conf_baseline),
-                        font,
-                        font_scale,
-                        (0, 0, 0),
-                        thickness,
-                        cv2.LINE_AA,
-                    )
+        # 각 트랙에 대해 persistent classification 수행
+        for trk in tracked_objects:
+            x1, y1, x2, y2, track_id = trk
+            track_id = int(track_id)
+            current_track_ids.add(track_id)
+            # 매 트랙에 대해 가장 좋은 매칭 검출을 찾기 위해 IoU 계산
+            best_iou = 0
+            best_det = None
+            for det in valid_det_info:
+                iou_val = self.compute_iou([x1, y1, x2, y2], det[:4])
+                if iou_val > best_iou:
+                    best_iou = iou_val
+                    best_det = det
+            if best_iou > 0.5 and best_det is not None:
+                det_class = best_det[5]
+                # 만약 검출된 클래스가 0이 아니라면 persistent flag를 True
+                if det_class != 0:
+                    self.track_flags[track_id] = True
+                else:
+                    if track_id not in self.track_flags:
+                        self.track_flags[track_id] = False
+            else:
+                if track_id not in self.track_flags:
+                    self.track_flags[track_id] = False
 
-        # 화면에 annotated_frame을 업데이트
+            # 트랙이 persistent flag가 True이면 valid_detection으로 판단
+            if self.track_flags.get(track_id, False):
+                valid_detection = True
+
+            # 화면에 tracked box와 id 표시 (초록색)
+            cv2.rectangle(
+                annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2
+            )
+            label_id = f"ID:{track_id}"
+            font = cv2.FONT_HERSHEY_SIMPLEX
+            font_scale = 0.5
+            thickness = 1
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label_id, font, font_scale, thickness
+            )
+            cv2.rectangle(
+                annotated_frame,
+                (int(x1), int(y1) - text_h - baseline),
+                (int(x1) + text_w, int(y1)),
+                (0, 255, 0),
+                -1,
+            )
+            cv2.putText(
+                annotated_frame,
+                label_id,
+                (int(x1), int(y1) - baseline),
+                font,
+                font_scale,
+                (0, 0, 0),
+                thickness,
+                cv2.LINE_AA,
+            )
+
+        # 트랙 ID 업데이트 후, dictionary에서 더 이상 보이지 않는 ID 제거
+        remove_keys = [tid for tid in self.track_flags if tid not in current_track_ids]
+        for tid in remove_keys:
+            del self.track_flags[tid]
+
         final_display = self.update_video_display(annotated_frame)
 
-        # 결과 라벨 업데이트: 유효한 검출이 있으면 "Detected", 없으면 "No Detection"
+        # 결과 라벨 업데이트
         if valid_detection:
             self.result_label.setText("Detected")
             self.result_label.setStyleSheet("color: green;")
@@ -263,6 +274,20 @@ class MainWindow(QWidget):
         self.frame_counter += 1
         if self.frame_counter % 30 == 0:
             self.update_stats_and_recent(inferred_class, final_display)
+
+    def compute_iou(self, boxA, boxB):
+        # box format: [x1, y1, x2, y2]
+        xA = max(boxA[0], boxB[0])
+        yA = max(boxA[1], boxB[1])
+        xB = min(boxA[2], boxB[2])
+        yB = min(boxA[3], boxB[3])
+        interW = max(0, xB - xA)
+        interH = max(0, yB - yA)
+        interArea = interW * interH
+        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
+        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
+        iou = interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+        return iou
 
     def closeEvent(self, event):
         self.cap.release()
