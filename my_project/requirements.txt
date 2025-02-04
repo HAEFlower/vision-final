@@ -6,3 +6,4 @@ ultralytics
 filterpy
 scikit-image
 lap
+efficientnet_pytorch

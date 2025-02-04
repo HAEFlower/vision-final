@@ -2,15 +2,10 @@ import sys
 import cv2
 import numpy as np
 import random
+import os
+import datetime
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QApplication
-from PyQt5.QtCore import (
-    QTimer,
-    QDateTime,
-    Qt,
-    QSize,
-    QRect,
-    QThreadPool,
-)
+from PyQt5.QtCore import QDateTime, Qt, QSize, QRect, QThreadPool, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QPainter
 
 # 사용자 정의 위젯 및 모듈 임포트
@@ -23,6 +18,9 @@ from ui.widgets.roi_label import ROILabel
 from utils.sort import Sort
 from model.inference_worker import InferenceWorker
 from model.classification_worker import ClassificationWorker
+
+# EfficientClassifier는 분류 모델 추론에 사용됩니다.
+from model.classifier_model import EfficientClassifier
 
 
 def create_thumbnail(pixmap, target_size):
@@ -66,7 +64,7 @@ class MainWindow(QWidget):
 
         self.tracker = Sort()
         self.track_flags = {}
-        # track_classifications는 각 track의 최종 분류 결과를 저장 (예, 0: 미분류, 1 또는 2: 분류된 상태)
+        # track_classifications: 각 track의 최종 분류 결과 저장, 예) 0: 미분류, 1 혹은 2: 분류됨
         self.track_classifications = {}
 
         # 통계용 변수 (누적 total 건수, 클래스별 건수)
@@ -80,13 +78,20 @@ class MainWindow(QWidget):
         # 분류 작업 병렬 처리를 위한 QThreadPool
         self.threadpool = QThreadPool()
 
+        # 여기서 EfficientClassifier 모델을 인스턴스화하여 분류 추론에 사용합니다.
+        self.efficient_classifier = EfficientClassifier(
+            model_path="model/efficient_classifier.pth",
+            num_classes=2,
+            model_name="efficientnet-b0",
+        )
+
         self.initialize_window()
         self.setup_ui_components()
         self.setup_webcam()
         self.setup_timers()
         self.update_time()
 
-        # QImage 버퍼 미리 할당 (매 프레임 객체 생성 최소화)
+        # QImage 버퍼 미리 할당
         self.qimage_buffer = QImage(
             self.video_width, self.video_height, QImage.Format_RGB888
         )
@@ -146,7 +151,7 @@ class MainWindow(QWidget):
     def setup_timers(self):
         self.timer_video = QTimer()
         self.timer_video.timeout.connect(self.update_frame)
-        self.timer_video.start(30)  # 약 33 FPS
+        self.timer_video.start(70)  # 약 33 FPS, 추론 70ms 기준
 
         self.timer_time = QTimer()
         self.timer_time.timeout.connect(self.update_time)
@@ -180,25 +185,37 @@ class MainWindow(QWidget):
             self.cumulative_total, self.cumulative_class_counts
         )
 
-    # TODO: 테스트용 임의 분류 결과 반환. 실제 모델에 따른 로직으로 대체 가능.
+    # EfficientClassifier 모델을 이용하여 crop_img를 분류하는 함수
     def perform_classification(self, crop_img):
-        return random.choice([0, 1, 2])
+        try:
+            predicted, confs = self.efficient_classifier.predict(crop_img)
+            if predicted is None:
+                print("perform_classification: predict returned None, defaulting to 0")
+                predicted = 0
+        except Exception as e:
+            print(f"분류 작업 중 오류 발생: {e}")
+            predicted = 0
+        return predicted
 
-    # classification_result 슬롯: 분류 결과를 받아 통계를 업데이트하고, 한 번 1 또는 2가 나오면 0으로 업데이트 되지 않도록 함.
-    def classification_result(self, track_id, predicted):
-        # 이미 분류 결과가 1 또는 2로 존재하면, 새 결과가 0이면 무시
+    # classification_result 슬롯: 분류 결과를 받아 추적 결과와 통계를 업데이트
+    def classification_result(self, track_id, result):
+        if isinstance(result, tuple):
+            predicted = result[0]
+        else:
+            predicted = result
+
+        if predicted is None:
+            predicted = 0
+
         if track_id in self.track_classifications:
             current = self.track_classifications[track_id]
             if current in [1, 2] and predicted == 0:
-                # 기존 분류를 유지
                 return
             elif current != predicted:
-                # 분류 변경: 통계 업데이트
                 self.cumulative_class_counts[current] -= 1
                 self.cumulative_class_counts[predicted] += 1
                 self.track_classifications[track_id] = predicted
         else:
-            # 새로운 track_id이면 바로 저장하고 통계 업데이트
             self.track_classifications[track_id] = predicted
             self.cumulative_total += 1
             self.cumulative_class_counts[predicted] += 1
@@ -307,9 +324,7 @@ class MainWindow(QWidget):
         else:
             tracked_objects = np.empty((0, 5))
 
-        valid_detection = False
         update_text = self.frame_counter % 3 == 0
-        update_thumbnail = self.frame_counter % 5 == 0
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.5
         thickness = 1
@@ -351,49 +366,47 @@ class MainWindow(QWidget):
             if crop_x2 > crop_x1 and crop_y2 > crop_y1:
                 crop_img = orig_frame[crop_y1:crop_y2, crop_x1:crop_x2]
                 if update_text:
+                    # ClassificationWorker에 self.efficient_classifier 인스턴스를 전달합니다.
                     worker = ClassificationWorker(
-                        crop_img, track_id, self.perform_classification
+                        crop_img, track_id, self.efficient_classifier
                     )
                     worker.signals.result_ready.connect(self.classification_result)
                     self.threadpool.start(worker)
                 predicted_class = self.track_classifications.get(track_id, None)
-                if predicted_class is not None:
-                    if update_text:
-                        text_pred = f"Cls: {predicted_class}"
-                        cv2.putText(
-                            annotated_frame,
-                            text_pred,
-                            (int(x1), int(y2) + text_h + baseline),
-                            font,
-                            font_scale,
-                            (255, 0, 0),
-                            thickness,
-                            cv2.LINE_AA,
-                        )
-                    if predicted_class in [1, 2] and update_thumbnail:
-                        crop_img_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-                        h_crop, w_crop, _ = crop_img_rgb.shape
-                        thumb_qimg = QImage(
-                            crop_img_rgb.data,
-                            w_crop,
-                            h_crop,
-                            w_crop * 3,
-                            QImage.Format_RGB888,
-                        )
-                        thumb_pixmap = QPixmap.fromImage(thumb_qimg)
-                        self.recent_images_widget.update_for_class(
-                            predicted_class, thumb_pixmap
-                        )
+                if predicted_class is not None and update_text:
+                    text_pred = f"Cls: {predicted_class}"
+                    cv2.putText(
+                        annotated_frame,
+                        text_pred,
+                        (int(x1), int(y2) + text_h + baseline),
+                        font,
+                        font_scale,
+                        (255, 0, 0),
+                        thickness,
+                        cv2.LINE_AA,
+                    )
+
+                # 최근 이미지(썸네일) 업데이트: 분류 결과가 1 또는 2이면 항상 업데이트
+                if (
+                    predicted_class in [1, 2]
+                    and crop_x2 > crop_x1
+                    and crop_y2 > crop_y1
+                ):
+                    crop_img_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
+                    h_crop, w_crop, _ = crop_img_rgb.shape
+                    thumb_qimg = QImage(
+                        crop_img_rgb.data,
+                        w_crop,
+                        h_crop,
+                        w_crop * 3,
+                        QImage.Format_RGB888,
+                    )
+                    thumb_pixmap = QPixmap.fromImage(thumb_qimg)
+                    self.recent_images_widget.update_for_class(
+                        predicted_class, thumb_pixmap
+                    )
 
         final_display = self.update_video_display(annotated_frame)
-
-        if valid_detection:
-            self.result_label.setText("Detected")
-            self.result_label.setStyleSheet("color: green;")
-        else:
-            self.result_label.setText("No Detection")
-            self.result_label.setStyleSheet("color: green;")
-
         self.frame_counter += 1
         self.update_stats_display()
 
