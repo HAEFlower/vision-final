@@ -2,3 +2,7 @@ PyQt5
 opencv-python-headless
 torch
 numpy
+ultralytics
+filterpy
+scikit-image
+lap
