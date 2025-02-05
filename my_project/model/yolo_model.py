@@ -38,7 +38,7 @@ def run_inference(yolo_model, input_image):
         target_class_idx = 0
 
     # inference 시 target_class_idx만 필터링하여 실행합니다.
-    results = yolo_model(input_image, classes=[target_class_idx])
+    results = yolo_model(input_image, classes=[target_class_idx], verbose=False)
     return results
 
 
