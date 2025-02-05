@@ -30,7 +30,7 @@ class EfficientClassifier:
     def __init__(
         self,
         model_path="model/efficient_classifier.pth",
-        num_classes=2,
+        num_classes=3,
         device=None,
         model_name="efficientnet-b0",
     ):
@@ -100,17 +100,31 @@ class EfficientClassifier:
 
 
 def main():
-    # 모델 파일 경로 및 분류 클래스 수는 실제 환경에 맞게 수정
+    # device 설정
+    import torch
+
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("MPS를 사용합니다:", device)
+    elif torch.cuda.is_available():
+        device = torch.device("cuda:0")
+        print("CUDA GPU를 사용합니다:", torch.cuda.get_device_name(0))
+    else:
+        device = torch.device("cpu")
+        print("CPU를 사용합니다.")
+
+    # EfficientClassifier 인스턴스 생성 시 device 전달
     classifier = EfficientClassifier(
         model_path="model/efficient_classifier.pth",
         num_classes=2,
         model_name="efficientnet-b0",
+        device=device,
     )
     if classifier.model is None:
         return
 
-    # 테스트 이미지 경로 (실제 이미지 경로로 변경)
-    image_path = "resources/test/test1.jpeg"
+    # 이하 코드는 동일
+    image_path = "resources/test/test1.png"
     if os.path.exists(image_path):
         input_image = cv2.imread(image_path)
     else:
@@ -121,7 +135,6 @@ def main():
     print(f"예측 결과 클래스: {predicted_class}")
     print(f"확률: {confs}")
 
-    # 결과 시각화 (cv2.putText 사용)
     annotated_image = input_image.copy()
     cv2.putText(
         annotated_image,
