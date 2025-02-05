@@ -1,14 +1,12 @@
 import sys
 import cv2
 import numpy as np
-import random
-import os
-import datetime
+import torch
 from PyQt5.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QApplication
 from PyQt5.QtCore import QDateTime, Qt, QSize, QRect, QThreadPool, QTimer
 from PyQt5.QtGui import QImage, QPixmap, QPainter
 
-# 사용자 정의 위젯 및 모듈 임포트
+# 사용자 정의 위젯 및 모듈 임포트 (각 파일의 위치에 맞게 수정)
 from ui.widgets.video_label import VideoLabel
 from ui.widgets.time_label import TimeLabel
 from ui.widgets.result_label import ResultLabel
@@ -19,8 +17,8 @@ from utils.sort import Sort
 from model.inference_worker import InferenceWorker
 from model.classification_worker import ClassificationWorker
 
-# EfficientClassifier는 분류 모델 추론에 사용됩니다.
-from model.classifier_model import EfficientClassifier
+# MobileNetV3Classifier를 사용 (mobile_classifier.py 내 정의)
+from model.mobile_classifier import MobileNetV3Classifier
 
 
 def create_thumbnail(pixmap, target_size):
@@ -44,14 +42,14 @@ class MainWindow(QWidget):
         super().__init__()
 
         # ---------------------------
-        # 창 및 내부 위젯 크기 설정
+        # 창 크기 설정: 1680×1050 (MacBook Air 등 화면 크기에 맞게)
         # ---------------------------
-        self.window_width = 1280
-        self.window_height = 720
+        self.window_width = 1680
+        self.window_height = 1050
 
-        # 비디오 영역: 창 크기의 절반 (예: 640x360)
-        self.video_width = int(self.window_width * 0.5)
-        self.video_height = int(self.window_height * 0.5)
+        # 비디오 영역: 화면 상에서 높은 해상도를 사용 (예: 1600×900)
+        self.video_width = 1280
+        self.video_height = 720
 
         # 최근 이미지(썸네일) 크기: 창 너비의 5%, 창 높이의 14%
         self.thumbnail_size = QSize(
@@ -64,10 +62,10 @@ class MainWindow(QWidget):
 
         self.tracker = Sort()
         self.track_flags = {}
-        # track_classifications: 각 트랙의 최종 분류 결과 저장. 예) 0: 미분류, 1 또는 2: 분류됨.
+        # track_classifications: 물체(트랙)별 분류 결과를 저장 (0: NG1, 1: NG2, 2: GOOD)
         self.track_classifications = {}
 
-        # 최근 이미지 업데이트에 사용된 마지막 분류 결과를 저장 (물체 id당)
+        # 최근 이미지 업데이트에 사용된 마지막 분류 결과 (물체 id당)
         self.last_recent_update = {}
 
         # 통계용 변수 (누적 total 건수, 클래스별 건수)
@@ -93,11 +91,11 @@ class MainWindow(QWidget):
             device = torch.device("cpu")
             print("CPU를 사용합니다.")
 
-        # EfficientClassifier의 인스턴스 생성 시 device 전달
-        self.efficient_classifier = EfficientClassifier(
-            model_path="model/efficient_classifier.pth",
+        # MobileNetV3Classifier 인스턴스 생성 (분류 모델)
+        self.classifier = MobileNetV3Classifier(
+            model_path="model/best_mobileNetv3.pth",
             num_classes=3,
-            model_name="efficientnet-b0",
+            model_name="mobilenet_v3_large",
             device=device,
         )
 
@@ -107,7 +105,7 @@ class MainWindow(QWidget):
         self.setup_timers()
         self.update_time()
 
-        # QImage 버퍼 미리 할당
+        # QImage 버퍼는 비디오 영역 해상도에 맞게 할당
         self.qimage_buffer = QImage(
             self.video_width, self.video_height, QImage.Format_RGB888
         )
@@ -118,7 +116,6 @@ class MainWindow(QWidget):
         self.setGeometry(100, 100, self.window_width, self.window_height)
 
     def setup_ui_components(self):
-        # 왼쪽 영역: 시간, 영상, 결과 표시
         self.time_label = TimeLabel()
         self.video_label = VideoLabel(width=self.video_width, height=self.video_height)
         self.roi_label = ROILabel(self.video_label)
@@ -134,7 +131,6 @@ class MainWindow(QWidget):
         self.left_container = QWidget()
         self.left_container.setLayout(self.left_layout)
 
-        # 오른쪽 영역: 통계 및 최근 이미지 표시
         self.stats_label = StatsLabel(self.num_classes)
         self.recent_images_widget = RecentImagesWidget(
             self.num_classes, thumbnail_size=self.thumbnail_size
@@ -150,9 +146,9 @@ class MainWindow(QWidget):
         main_layout.addWidget(self.right_container)
         self.setLayout(main_layout)
 
-        # 기본 ROI 설정
-        default_width = int(self.video_width * 0.4)
-        default_height = int(self.video_height * 1.0)
+        # ROI 설정: 비디오 영역 중앙에 926×926 픽셀 영역으로 지정
+        default_width = 926
+        default_height = 926
         default_x = (self.video_width - default_width) // 2
         default_y = (self.video_height - default_height) // 2
         self.roi_label.roi_rect = QRect(
@@ -161,13 +157,14 @@ class MainWindow(QWidget):
 
     def setup_webcam(self):
         self.cap = cv2.VideoCapture(0)
+        # 비디오 캡처 해상도를 self.video_width, self.video_height로 설정
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.video_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.video_height)
 
     def setup_timers(self):
         self.timer_video = QTimer()
         self.timer_video.timeout.connect(self.update_frame)
-        self.timer_video.start(10)  # 빠른 업데이트: 약 33 FPS
+        self.timer_video.start(10)  # 약 33 FPS
 
         self.timer_time = QTimer()
         self.timer_time.timeout.connect(self.update_time)
@@ -182,7 +179,6 @@ class MainWindow(QWidget):
             display_frame = cv2.resize(frame, (self.video_width, self.video_height))
         else:
             display_frame = frame
-
         rgb_frame = cv2.cvtColor(display_frame, cv2.COLOR_BGR2RGB)
         ptr = self.qimage_buffer.bits()
         ptr.setsize(self.qimage_buffer.byteCount())
@@ -190,7 +186,6 @@ class MainWindow(QWidget):
             (self.video_height, self.video_width, 3)
         )
         np.copyto(data, rgb_frame)
-
         pix = QPixmap.fromImage(self.qimage_buffer)
         self.video_label.setPixmap(pix)
         self.roi_label.setGeometry(0, 0, self.video_width, self.video_height)
@@ -201,33 +196,29 @@ class MainWindow(QWidget):
             self.cumulative_total, self.cumulative_class_counts
         )
 
-    # EfficientClassifier를 이용해 crop_img를 분류
     def perform_classification(self, crop_img):
         try:
-            predicted, confs = self.efficient_classifier.predict(crop_img)
+            # MobileNetV3Classifier 내부 전처리(transform)에 모든 처리가 위임됨
+            predicted, confs = self.classifier.predict(crop_img)
             if predicted is None:
                 print("perform_classification: predict returned None, defaulting to 0")
                 predicted = 0
         except Exception as e:
             print(f"분류 작업 중 오류 발생: {e}")
             predicted = 0
+        # 모델 예측값 그대로 사용: 0: NG1, 1: NG2, 2: GOOD
         return predicted
 
-    # classification_result 슬롯: 분류 결과를 받아 트랙의 결과 및 통계를 업데이트
     def classification_result(self, track_id, result):
         if isinstance(result, tuple):
             predicted = result[0]
         else:
             predicted = result
-
         if predicted is None:
             predicted = 0
-
         if track_id in self.track_classifications:
             current = self.track_classifications[track_id]
-            if current in [1, 2] and predicted == 0:
-                return
-            elif current != predicted:
+            if current != predicted:
                 self.cumulative_class_counts[current] -= 1
                 self.cumulative_class_counts[predicted] += 1
                 self.track_classifications[track_id] = predicted
@@ -245,27 +236,22 @@ class MainWindow(QWidget):
         ret, frame = self.cap.read()
         if not ret:
             return
-
-        # 프레임 전처리
         if frame.shape[1] != self.video_width or frame.shape[0] != self.video_height:
             display_frame = cv2.resize(frame, (self.video_width, self.video_height))
         else:
             display_frame = frame
 
-        # YOLO에 넣을 프레임을 저장 (self.inference_frame)
+        # 추론용 프레임 저장
         self.inference_frame = display_frame.copy()
 
-        # 비동기 추론 수행 (저장한 self.inference_frame 사용)
         if self.inference_worker is None or not self.inference_worker.isRunning():
             self.inference_worker = InferenceWorker(self.inference_frame)
             self.inference_worker.result_ready.connect(self.handle_inference_result)
             self.inference_worker.start()
         results = self.inference_result
 
-        # crop할 때에는 동일 프레임(self.inference_frame) 사용
         orig_frame = self.inference_frame.copy()
         disp_h, disp_w, _ = display_frame.shape
-
         roi = self.roi_label.roi_rect
         if roi is not None:
             roi_x1 = max(0, roi.x())
@@ -277,7 +263,6 @@ class MainWindow(QWidget):
 
         valid_det_info = []
         annotated_frame = display_frame.copy()
-
         if results is not None and results[0].boxes is not None:
             try:
                 boxes = results[0].boxes.xyxy.cpu().numpy()
@@ -287,9 +272,7 @@ class MainWindow(QWidget):
                 boxes = results[0].boxes.xyxy.numpy()
                 confs = results[0].boxes.conf.numpy()
                 cls_ids = results[0].boxes.cls.numpy()
-
             valid_threshold_vertical = 0.8
-
             for i, box in enumerate(boxes):
                 x1, y1, x2, y2 = box
                 detection_area = max(1, (x2 - x1) * (y2 - y1))
@@ -344,14 +327,13 @@ class MainWindow(QWidget):
         font_scale = 0.5
         thickness = 1
 
-        # 각 트랙별로 박스와 분류, 최근 이미지 업데이트
+        # 각 트랙별 박스, 분류 결과 및 recent 이미지 업데이트
         for trk in tracked_objects:
             x1, y1, x2, y2, track_id = trk
             track_id = int(track_id)
             cv2.rectangle(
                 annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2
             )
-
             label_id = f"ID:{track_id}"
             (text_w, text_h), baseline = cv2.getTextSize(
                 label_id, font, font_scale, thickness
@@ -373,25 +355,31 @@ class MainWindow(QWidget):
                 thickness,
                 cv2.LINE_AA,
             )
-
             crop_x1 = max(0, int(x1))
             crop_y1 = max(0, int(y1))
             crop_x2 = min(int(x2), disp_w)
             crop_y2 = min(int(y2), disp_h)
             if crop_x2 > crop_x1 and crop_y2 > crop_y1:
                 crop_img = orig_frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                # ClassificationWorker에 self.efficient_classifier 인스턴스를 전달
                 worker = ClassificationWorker(
-                    crop_img, track_id, self.efficient_classifier.predict
+                    crop_img, track_id, self.classifier.predict
                 )
                 worker.signals.result_ready.connect(self.classification_result)
                 self.threadpool.start(worker)
                 predicted_class = self.track_classifications.get(track_id, None)
                 if predicted_class is not None:
-                    text_pred = f"Cls: {predicted_class}"
+                    # 매핑: 0 → NG1, 1 → NG2, 2 → GOOD
+                    if predicted_class == 0:
+                        text_pred = "NG1"
+                    elif predicted_class == 1:
+                        text_pred = "NG2"
+                    elif predicted_class == 2:
+                        text_pred = "GOOD"
+                    else:
+                        text_pred = str(predicted_class)
                     cv2.putText(
                         annotated_frame,
-                        text_pred,
+                        f"Cls: {text_pred}",
                         (int(x1), int(y2) + text_h + baseline),
                         font,
                         font_scale,
@@ -399,17 +387,13 @@ class MainWindow(QWidget):
                         thickness,
                         cv2.LINE_AA,
                     )
-
-                # 최근 이미지 업데이트: 오직 분류 결과가 변할 때만 업데이트하도록 함
                 if (
-                    predicted_class in [1, 2]
+                    predicted_class in [0, 1, 2]
                     and crop_x2 > crop_x1
                     and crop_y2 > crop_y1
                 ):
-                    # 현재 분류 결과와 이전에 업데이트한 결과 비교
                     prev_class = self.last_recent_update.get(track_id, None)
                     if prev_class != predicted_class:
-                        # 분류 결과가 변경되었을 경우에만 업데이트
                         crop_img_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
                         h_crop, w_crop, _ = crop_img_rgb.shape
                         thumb_qimg = QImage(
@@ -426,21 +410,23 @@ class MainWindow(QWidget):
                         self.last_recent_update[track_id] = predicted_class
 
         final_display = self.update_video_display(annotated_frame)
-
-        # 결과 라벨 업데이트: 모든 트랙 중 하나라도 분류 결과가 1 또는 2면 "불합격",
-        # 모두 0이면 "합격", 트랙 정보가 없으면 "정보 없음"을 표시
         if self.track_classifications:
-            if any(cls in [1, 2] for cls in self.track_classifications.values()):
-                overall_text = "불합격"
-                self.result_label.setStyleSheet("color: red;")
-            else:
-                overall_text = "합격"
+            classes_present = set(self.track_classifications.values())
+            if classes_present == {2}:
+                overall_text = "GOOD"
                 self.result_label.setStyleSheet("color: green;")
+            else:
+                defect_labels = []
+                if 0 in classes_present:
+                    defect_labels.append("NG1")
+                if 1 in classes_present:
+                    defect_labels.append("NG2")
+                overall_text = ", ".join(defect_labels) + " 불량"
+                self.result_label.setStyleSheet("color: red;")
         else:
             overall_text = "정보 없음"
             self.result_label.setStyleSheet("color: gray;")
         self.result_label.setText(overall_text)
-
         self.frame_counter += 1
         self.update_stats_display()
 

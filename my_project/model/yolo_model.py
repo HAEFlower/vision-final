@@ -48,7 +48,7 @@ def main():
         return
 
     # 테스트 이미지 경로 설정 (실제 bottle 이미지 경로로 변경하세요)
-    image_path = "path/to/your/bottle_image.jpg"
+    image_path = "resources/test/test2.png"
     if os.path.exists(image_path):
         input_image = cv2.imread(image_path)
     else:

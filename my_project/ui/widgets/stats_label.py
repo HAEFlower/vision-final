@@ -8,6 +8,8 @@ class StatsLabel(QLabel):
         self.num_classes = num_classes
         self.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.setTextFormat(Qt.RichText)
+        # 클래스 번호에 대한 레이블 매핑
+        self.labels = {0: "NG1", 1: "NG2", 2: "GOOD"}
         self.setText(self.build_initial_text())
 
     def build_initial_text(self):
@@ -15,8 +17,9 @@ class StatsLabel(QLabel):
             "<p style='font-size:30pt; font-weight:bold; margin:0 0 20px;'>Total: 0</p>"
         )
         for cls in range(self.num_classes):
+            label = self.labels.get(cls, f"Class {cls}")
             stats_html += (
-                f"<p style='font-size:24pt; margin:0 0 15px;'>Class {cls}: 0 (0.0%)</p>"
+                f"<p style='font-size:24pt; margin:0 0 15px;'>{label}: 0 (0.0%)</p>"
             )
         return stats_html
 
@@ -25,5 +28,6 @@ class StatsLabel(QLabel):
         for cls in range(self.num_classes):
             count = class_counts.get(cls, 0)
             percent = (count / total_count * 100) if total_count > 0 else 0.0
-            stats_html += f"<p style='font-size:24pt; margin:0 0 15px;'>Class {cls}: {count} ({percent:.1f}%)</p>"
+            label = self.labels.get(cls, f"Class {cls}")
+            stats_html += f"<p style='font-size:24pt; margin:0 0 15px;'>{label}: {count} ({percent:.1f}%)</p>"
         self.setText(stats_html)
