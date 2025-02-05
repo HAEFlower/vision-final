@@ -60,12 +60,15 @@ class MainWindow(QWidget):
         # -------------------------------------------------------------------------
 
         self.num_classes = 3
-        self.roi_threshold = 1.0
+        self.roi_threshold = 0.9
 
         self.tracker = Sort()
         self.track_flags = {}
-        # track_classifications: 각 track의 최종 분류 결과 저장, 예) 0: 미분류, 1 혹은 2: 분류됨
+        # track_classifications: 각 트랙의 최종 분류 결과 저장. 예) 0: 미분류, 1 또는 2: 분류됨.
         self.track_classifications = {}
+
+        # 최근 이미지 업데이트에 사용된 마지막 분류 결과를 저장 (물체 id당)
+        self.last_recent_update = {}
 
         # 통계용 변수 (누적 total 건수, 클래스별 건수)
         self.cumulative_total = 0
@@ -147,9 +150,9 @@ class MainWindow(QWidget):
         main_layout.addWidget(self.right_container)
         self.setLayout(main_layout)
 
-        # 기본 ROI 설정: 비디오 영역 중앙에서 전체 크기의 60%로 설정
-        default_width = int(self.video_width * 0.6)
-        default_height = int(self.video_height * 0.6)
+        # 기본 ROI 설정
+        default_width = int(self.video_width * 0.4)
+        default_height = int(self.video_height * 1.0)
         default_x = (self.video_width - default_width) // 2
         default_y = (self.video_height - default_height) // 2
         self.roi_label.roi_rect = QRect(
@@ -164,7 +167,7 @@ class MainWindow(QWidget):
     def setup_timers(self):
         self.timer_video = QTimer()
         self.timer_video.timeout.connect(self.update_frame)
-        self.timer_video.start(70)  # 약 33 FPS, 추론 70ms 기준
+        self.timer_video.start(10)  # 빠른 업데이트: 약 33 FPS
 
         self.timer_time = QTimer()
         self.timer_time.timeout.connect(self.update_time)
@@ -198,7 +201,7 @@ class MainWindow(QWidget):
             self.cumulative_total, self.cumulative_class_counts
         )
 
-    # EfficientClassifier 모델을 이용하여 crop_img를 분류하는 함수
+    # EfficientClassifier를 이용해 crop_img를 분류
     def perform_classification(self, crop_img):
         try:
             predicted, confs = self.efficient_classifier.predict(crop_img)
@@ -210,7 +213,7 @@ class MainWindow(QWidget):
             predicted = 0
         return predicted
 
-    # classification_result 슬롯: 분류 결과를 받아 추적 결과와 통계를 업데이트
+    # classification_result 슬롯: 분류 결과를 받아 트랙의 결과 및 통계를 업데이트
     def classification_result(self, track_id, result):
         if isinstance(result, tuple):
             predicted = result[0]
@@ -243,20 +246,24 @@ class MainWindow(QWidget):
         if not ret:
             return
 
+        # 프레임 전처리
         if frame.shape[1] != self.video_width or frame.shape[0] != self.video_height:
             display_frame = cv2.resize(frame, (self.video_width, self.video_height))
         else:
             display_frame = frame
 
-        # 비동기 추론 수행
-        frame_for_inference = display_frame.copy()
+        # YOLO에 넣을 프레임을 저장 (self.inference_frame)
+        self.inference_frame = display_frame.copy()
+
+        # 비동기 추론 수행 (저장한 self.inference_frame 사용)
         if self.inference_worker is None or not self.inference_worker.isRunning():
-            self.inference_worker = InferenceWorker(frame_for_inference)
+            self.inference_worker = InferenceWorker(self.inference_frame)
             self.inference_worker.result_ready.connect(self.handle_inference_result)
             self.inference_worker.start()
         results = self.inference_result
 
-        orig_frame = display_frame.copy()
+        # crop할 때에는 동일 프레임(self.inference_frame) 사용
+        orig_frame = self.inference_frame.copy()
         disp_h, disp_w, _ = display_frame.shape
 
         roi = self.roi_label.roi_rect
@@ -295,9 +302,7 @@ class MainWindow(QWidget):
                     inter_h = max(0, inter_y2 - inter_y1)
                     intersection_area = inter_w * inter_h
                     ratio = intersection_area / detection_area
-
                     vertical_coverage = inter_h / (y2 - y1)
-
                     center_x = (x1 + x2) / 2
                     center_y = (y1 + y2) / 2
                     center_inside = (
@@ -306,7 +311,6 @@ class MainWindow(QWidget):
                         and center_y >= roi_y1
                         and center_y <= roi_y2
                     )
-
                     if (
                         ratio >= self.roi_threshold
                         and vertical_coverage >= valid_threshold_vertical
@@ -336,12 +340,11 @@ class MainWindow(QWidget):
             tracked_objects = self.tracker.update(dets)
         else:
             tracked_objects = np.empty((0, 5))
-        valid_detection = False
-        update_text = self.frame_counter % 3 == 0
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.5
         thickness = 1
 
+        # 각 트랙별로 박스와 분류, 최근 이미지 업데이트
         for trk in tracked_objects:
             x1, y1, x2, y2, track_id = trk
             track_id = int(track_id)
@@ -349,28 +352,27 @@ class MainWindow(QWidget):
                 annotated_frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 255, 0), 2
             )
 
-            if update_text:
-                label_id = f"ID:{track_id}"
-                (text_w, text_h), baseline = cv2.getTextSize(
-                    label_id, font, font_scale, thickness
-                )
-                cv2.rectangle(
-                    annotated_frame,
-                    (int(x1), int(y1) - text_h - baseline),
-                    (int(x1) + text_w, int(y1)),
-                    (0, 255, 0),
-                    -1,
-                )
-                cv2.putText(
-                    annotated_frame,
-                    label_id,
-                    (int(x1), int(y1) - baseline),
-                    font,
-                    font_scale,
-                    (0, 0, 0),
-                    thickness,
-                    cv2.LINE_AA,
-                )
+            label_id = f"ID:{track_id}"
+            (text_w, text_h), baseline = cv2.getTextSize(
+                label_id, font, font_scale, thickness
+            )
+            cv2.rectangle(
+                annotated_frame,
+                (int(x1), int(y1) - text_h - baseline),
+                (int(x1) + text_w, int(y1)),
+                (0, 255, 0),
+                -1,
+            )
+            cv2.putText(
+                annotated_frame,
+                label_id,
+                (int(x1), int(y1) - baseline),
+                font,
+                font_scale,
+                (0, 0, 0),
+                thickness,
+                cv2.LINE_AA,
+            )
 
             crop_x1 = max(0, int(x1))
             crop_y1 = max(0, int(y1))
@@ -378,15 +380,14 @@ class MainWindow(QWidget):
             crop_y2 = min(int(y2), disp_h)
             if crop_x2 > crop_x1 and crop_y2 > crop_y1:
                 crop_img = orig_frame[crop_y1:crop_y2, crop_x1:crop_x2]
-                if update_text:
-                    # ClassificationWorker에 self.efficient_classifier 인스턴스를 전달합니다.
-                    worker = ClassificationWorker(
-                        crop_img, track_id, self.efficient_classifier.predict
-                    )
-                    worker.signals.result_ready.connect(self.classification_result)
-                    self.threadpool.start(worker)
+                # ClassificationWorker에 self.efficient_classifier 인스턴스를 전달
+                worker = ClassificationWorker(
+                    crop_img, track_id, self.efficient_classifier.predict
+                )
+                worker.signals.result_ready.connect(self.classification_result)
+                self.threadpool.start(worker)
                 predicted_class = self.track_classifications.get(track_id, None)
-                if predicted_class is not None and update_text:
+                if predicted_class is not None:
                     text_pred = f"Cls: {predicted_class}"
                     cv2.putText(
                         annotated_frame,
@@ -399,47 +400,54 @@ class MainWindow(QWidget):
                         cv2.LINE_AA,
                     )
 
-                # 최근 이미지(썸네일) 업데이트: 분류 결과가 1 또는 2이면 항상 업데이트
+                # 최근 이미지 업데이트: 오직 분류 결과가 변할 때만 업데이트하도록 함
                 if (
                     predicted_class in [1, 2]
                     and crop_x2 > crop_x1
                     and crop_y2 > crop_y1
                 ):
-                    crop_img_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
-                    h_crop, w_crop, _ = crop_img_rgb.shape
-                    thumb_qimg = QImage(
-                        crop_img_rgb.data,
-                        w_crop,
-                        h_crop,
-                        w_crop * 3,
-                        QImage.Format_RGB888,
-                    )
-                    thumb_pixmap = QPixmap.fromImage(thumb_qimg)
-                    self.recent_images_widget.update_for_class(
-                        predicted_class, thumb_pixmap
-                    )
+                    # 현재 분류 결과와 이전에 업데이트한 결과 비교
+                    prev_class = self.last_recent_update.get(track_id, None)
+                    if prev_class != predicted_class:
+                        # 분류 결과가 변경되었을 경우에만 업데이트
+                        crop_img_rgb = cv2.cvtColor(crop_img, cv2.COLOR_BGR2RGB)
+                        h_crop, w_crop, _ = crop_img_rgb.shape
+                        thumb_qimg = QImage(
+                            crop_img_rgb.data,
+                            w_crop,
+                            h_crop,
+                            w_crop * 3,
+                            QImage.Format_RGB888,
+                        )
+                        thumb_pixmap = QPixmap.fromImage(thumb_qimg)
+                        self.recent_images_widget.update_for_class(
+                            predicted_class, thumb_pixmap
+                        )
+                        self.last_recent_update[track_id] = predicted_class
 
         final_display = self.update_video_display(annotated_frame)
-        if valid_detection:
-            self.result_label.setText("Detected")
-            self.result_label.setStyleSheet("color: green;")
+
+        # 결과 라벨 업데이트: 모든 트랙 중 하나라도 분류 결과가 1 또는 2면 "불합격",
+        # 모두 0이면 "합격", 트랙 정보가 없으면 "정보 없음"을 표시
+        if self.track_classifications:
+            if any(cls in [1, 2] for cls in self.track_classifications.values()):
+                overall_text = "불합격"
+                self.result_label.setStyleSheet("color: red;")
+            else:
+                overall_text = "합격"
+                self.result_label.setStyleSheet("color: green;")
         else:
-            self.result_label.setText("No Detection")
-            self.result_label.setStyleSheet("color: green;")
+            overall_text = "정보 없음"
+            self.result_label.setStyleSheet("color: gray;")
+        self.result_label.setText(overall_text)
+
         self.frame_counter += 1
         self.update_stats_display()
 
-    def compute_iou(self, boxA, boxB):
-        xA = max(boxA[0], boxB[0])
-        yA = max(boxA[1], boxB[1])
-        xB = min(boxA[2], boxB[2])
-        yB = min(boxA[3], boxB[3])
-        interW = max(0, xB - xA)
-        interH = max(0, yB - yA)
-        interArea = interW * interH
-        boxAArea = (boxA[2] - boxA[0]) * (boxA[3] - boxA[1])
-        boxBArea = (boxB[2] - boxB[0]) * (boxB[3] - boxB[1])
-        return interArea / float(boxAArea + boxBArea - interArea + 1e-6)
+    def update_stats_display(self):
+        self.stats_label.update_text(
+            self.cumulative_total, self.cumulative_class_counts
+        )
 
     def closeEvent(self, event):
         self.cap.release()
