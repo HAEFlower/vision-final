@@ -161,10 +161,11 @@ class MainWindow(QWidget):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.video_width)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.video_height)
 
+    # 프레임조절 함수
     def setup_timers(self):
         self.timer_video = QTimer()
         self.timer_video.timeout.connect(self.update_frame)
-        self.timer_video.start(10)  # 약 33 FPS
+        self.timer_video.start(30)  # 약 33 FPS
 
         self.timer_time = QTimer()
         self.timer_time.timeout.connect(self.update_time)

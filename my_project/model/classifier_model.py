@@ -26,6 +26,45 @@ class EfficientClassifierModel(nn.Module):
         return self.base_model(x)
 
 
+class RedRegionExtract(object):
+    def __call__(self, image):
+        """
+        image: PIL 이미지 (RGB)
+        반환: 빨간색 영역을 추출하여 정사각형 크롭한 PIL 이미지.
+              빨간 영역을 찾지 못하면 원본 이미지를 그대로 반환.
+        """
+        print("RedRegionExtract 호출")
+        # PIL(RGB) -> OpenCV(BGR): 마지막 축 뒤집기
+        image_cv = np.array(image)[:, :, ::-1]
+        hsv = cv2.cvtColor(image_cv, cv2.COLOR_BGR2HSV)
+        lower_red1 = np.array([0, 120, 70])
+        upper_red1 = np.array([10, 255, 255])
+        lower_red2 = np.array([170, 120, 70])
+        upper_red2 = np.array([180, 255, 255])
+        mask1 = cv2.inRange(hsv, lower_red1, upper_red1)
+        mask2 = cv2.inRange(hsv, lower_red2, upper_red2)
+        mask = mask1 + mask2
+        red_highlighted = cv2.bitwise_and(image_cv, image_cv, mask=mask)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if contours:
+            c = max(contours, key=cv2.contourArea)
+            x, y, w, h = cv2.boundingRect(c)
+            side_length = max(w, h)
+            center_x, center_y = x + w // 2, y + h // 2
+            half_side = side_length // 2
+            start_x = max(center_x - half_side, 0)
+            start_y = max(center_y - half_side, 0)
+            end_x = min(center_x + half_side, image_cv.shape[1])
+            end_y = min(center_y + half_side, image_cv.shape[0])
+            square_crop = red_highlighted[start_y:end_y, start_x:end_x]
+        else:
+            print("빨간 영역을 찾을 수 없습니다. 원본 이미지를 그대로 사용합니다.")
+            square_crop = image_cv
+        # 다시 OpenCV(BGR) -> PIL(RGB)
+        square_crop = cv2.cvtColor(square_crop, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(square_crop)
+
+
 class EfficientClassifier:
     def __init__(
         self,
@@ -66,11 +105,11 @@ class EfficientClassifier:
             print(f"{model_path} 파일이 존재하지 않습니다. 모델 파일을 확인하세요.")
             self.model = None
 
-        # 전처리 transform (EfficientNet-B0 기준 ImageNet normalization)
+        # 전처리 파이프라인: RedRegionExtract → Resize → ToTensor → Normalize
         self.transform = transforms.Compose(
             [
-                transforms.ToPILImage(),
-                transforms.Resize((224, 224)),  # EfficientNet-B0의 일반 입력 크기
+                RedRegionExtract(),
+                transforms.Resize((224, 224)),
                 transforms.ToTensor(),
                 transforms.Normalize(
                     mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]
